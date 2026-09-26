@@ -253,6 +253,10 @@ def sync_config(
             name = raw.strip()
             if name:
                 wanted.add(name)
+        if not wanted:
+            raise ModelSyncError(
+                "no usable --provider name given (all names are blank)"
+            )
         missing = sorted(w for w in wanted if w not in by_name)
         if missing:
             available = ", ".join(sorted(by_name)) or "<none>"

@@ -634,6 +634,14 @@ def test_missing_target_endpoint_name_is_error():
         sync_config(target, source, allow_delete=True, provider_names=["endpointa"])
 
 
+def test_blank_only_provider_name_raises():
+    # A --provider value that is only whitespace must not silently act as --all.
+    source = _make_source("EndpointA", [{"id": "new-model", "url": "https://x.example.com"}])
+    target = [_custom_endpoint("EndpointA", models=[])]
+    with pytest.raises(ModelSyncError, match="no usable"):
+        sync_config(target, source, allow_delete=True, provider_names=["   "])
+
+
 def test_new_model_gets_only_canonical_fields():
     source = _make_source("EndpointA", [
         {

@@ -38,7 +38,7 @@ python -m dsh_copilot_sync.cli \
 | `--dsh-dir PATH` | dsh 数据文件夹路径（必须）。默认读取其中的 `settings.yaml.imported`（存在时），否则读取该目录下所有 `*.yaml`/`*.yml`/`*.json` 一级源文件（跳过 `credentials.yaml`、`sync.ffs_db`、`package.json`、点开头文件） |
 | `--config PATH` | `chatLanguageModels.json` 路径（必须） |
 | `--all` | 同步所有同名 `customendpoint`（与 `--provider` 二选一，必须指定其一） |
-| `--provider NAME` | 只同步指定目标端点（可重复使用）；名称在目标中不存在时报配置错误 |
+| `--provider NAME` | 只同步指定目标端点（可重复使用）；名称在目标中不存在、或所有名称均为空白时报配置错误 |
 | `--dry-run` | 只显示变更，不写文件 |
 | `--no-delete` | 只新增；不删除模型、不删除 `settings` 项、不覆盖已有模型 |
 | `--verbose` | 输出详细日志（未匹配端点、跳过的模型等） |
@@ -154,7 +154,7 @@ python -m dsh_copilot_sync.cli \
 python -m pytest
 ```
 
-34 个用例覆盖规格中的 13 项必测场景（新增、保留本地配置、默认删除 +
+37 个用例覆盖规格中的 13 项必测场景（新增、保留本地配置、默认删除 +
 `settings`、`--no-delete`、`--dry-run`、源读取失败、空模型列表、
 非 customendpoint 不变、copilot 不变、源端点名重复报错、幂等二次运行、
 原子写入同内容跳过、目标 JSON 无效/非数组），全部离线、不访问网络、
