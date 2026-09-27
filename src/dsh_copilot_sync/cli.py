@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="providers",
         metavar="NAME",
         default=[],
-        help="sync only the named target endpoint (repeatable)",
+        help="sync only the named target endpoint (repeatable, case-insensitive)",
     )
     parser.add_argument(
         "--dry-run",

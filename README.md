@@ -1,7 +1,8 @@
 # dsh-copilot-sync — 把 dsh 模型列表离线同步到 VS Code Copilot BYOK
 
 单向、本地、离线地把 `dsh/` 数据文件夹中的模型列表同步到 VS Code 的 `chatLanguageModels.json`。匹配规则：**同名端点**
-（`dsh` 端点的 `name` 与目标端点的 `name` 一致），只写
+（`dsh` 端点的 `displayName` 级名称优先、provider key 兜底，与目标端点的 `name` 去首尾空格后**不区分大小写**一致，
+如源端 `displayName: Iris` 可匹配目标端 `iris`），只写
 `vendor == "customendpoint"` 条目。
 
 - 不访问网络
@@ -97,10 +98,20 @@ python -m dsh_copilot_sync.cli \
 
 ## 匹配规则
 
-- 按 `name.trim()` 精确匹配，**大小写敏感**。
-- 目标文件中同一端点名在 `customendpoint` 条目中出现多次：该端点报错
+- 按 `name.trim()` 匹配，**大小写不敏感**（Unicode case folding），
+  分两级：先比源端点的 **displayName 级名称**（规范名/`displayName`
+  优先）；都没命中时，再比 provider **key 派生的兜底名**
+  （键原文、去 `llm-` 前缀的键、由键派生的显示名）。
+  例如源端 `providers: iris:` + `displayName: Iris`，目标端
+  `iris`、`Iris`、`IRIS` 都能绑上（走 displayName 级）。
+- 同一级别内，目标端点名命中多个不同源端点：该目标端点视为
+  歧义，报错并保持原样（非致命，其他端点继续同步）。
+  注意 displayName 级优先：若某目标名在 displayName 级命中了源端点 A，
+  即使另一源端点 B 的 key 恰好同名，也直接绑 A，不判歧义。
+- 目标文件中同一端点名在 `customendpoint` 条目中出现多次（比较时
+  同样忽略大小写，`Foo` + `foo` 算重复）：该端点报错
   并保持原样（非致命，其他端点继续同步）。
-- 源端点名重复（跨文件或同文件内）：**配置错误**（退出码 1）。
+- 源端点名重复（跨文件或同文件内，比较时忽略大小写）：**配置错误**（退出码 1）。
 - 源中有、目标中没有同名端点：跳过并记录（`--verbose` 可见），**不创建新端点**。
   使用 `--provider` 时，“源中有、目标中没有”的记录与报告只覆盖被选中的端点；
   未被 `--provider` 选中的源端点不参与本次同步，也不计入未匹配列表（这是
@@ -144,7 +155,10 @@ python -m dsh_copilot_sync.cli \
 - 只读 `--dsh-dir` 一级目录下的源文件（不含子目录递归）。
 - 端点级错误（如某模型缺 url）时，该端点已有模型仍可能保留/新增，
   写入照常进行；只有全局配置错误（退出码 1）才完全不写。
-- 同名匹配是精确字符串匹配：`EndpointA` 不会匹配 `endpointa`。
+- 同名匹配忽略大小写，分 displayName 级优先、key 级兜底两级：
+  `EndpointA` 会匹配 `endpointa`；` Iris `（两侧空格）也会匹配 `iris`。
+  仅当同一折叠名对应多个不同目标条目、或在**同一级别**内对应多个不同
+  源端点时才视为歧义而跳过（displayName 级命中则 key 级不再参与竞争）。
 - 删除规则中“源端点读取失败”按端点粒度判断：只要该端点在源中存在且
   有 ≥1 个有效模型 id，删除即视为安全；源文件级解析失败是全局配置错误。
 
@@ -154,7 +168,7 @@ python -m dsh_copilot_sync.cli \
 python -m pytest
 ```
 
-37 个用例覆盖规格中的 13 项必测场景（新增、保留本地配置、默认删除 +
+48 个用例覆盖规格中的 13 项必测场景（新增、保留本地配置、默认删除 +
 `settings`、`--no-delete`、`--dry-run`、源读取失败、空模型列表、
 非 customendpoint 不变、copilot 不变、源端点名重复报错、幂等二次运行、
 原子写入同内容跳过、目标 JSON 无效/非数组），全部离线、不访问网络、

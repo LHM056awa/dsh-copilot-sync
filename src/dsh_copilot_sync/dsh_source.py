@@ -34,9 +34,14 @@ Normalisation guarantees:
 * endpoint names: a block's ``displayName`` wins, otherwise the name is
   derived from the provider key (a leading ``llm-`` prefix is stripped and
   the key is title-cased with the same rules as
-  :func:`dsh_copilot_sync.models.base_display_name`);
+  :func:`dsh_copilot_sync.models.base_display_name`); every endpoint also
+  keeps key-derived fallbacks (raw key, unprefixed key, key-derived
+  name).  Matching is two-level and case-insensitive: display-level
+  primary names (``displayName`` priority) are tried first, key-derived
+  names only bind when no primary name matches;
 * the same trimmed endpoint name appearing more than once across the
-  loaded files is a configuration error (spec: 源端点名称重复时报错).
+  loaded files (compared case-insensitively) is a configuration error
+  (spec: 源端点名称重复时报错).
 
 No network access, no credential handling: ``apiKeyEnv`` names are
 deliberately ignored and no key material is ever read or returned.
@@ -49,7 +54,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from .models import DshEndpoint, DshModel, ModelSyncError, base_display_name
+from .models import DshEndpoint, DshModel, ModelSyncError, base_display_name, fold_name
 
 PathLike = Union[str, "os.PathLike[str]"]
 
@@ -119,7 +124,13 @@ def _apply_aliases(raw: Any) -> Any:
     return entry
 
 
-def _build_endpoint(name: str, block: Dict[str, Any]) -> DshEndpoint:
+def _build_endpoint(
+    name: str,
+    block: Dict[str, Any],
+    *,
+    aliases: Optional[Sequence[str]] = None,
+    fallback_aliases: Optional[Sequence[str]] = None,
+) -> DshEndpoint:
     """Validate/deduplicate one provider block into a DshEndpoint."""
     fallback_url = normalize_base_url(block.get("baseURL") or block.get("url"))
     models: List[DshModel] = []
@@ -152,7 +163,16 @@ def _build_endpoint(name: str, block: Dict[str, Any]) -> DshEndpoint:
         models.append(model)
     if not models and not note:
         note = "no valid model ids (missing, empty, or non-string)"
-    return DshEndpoint(name=name, models=models, fallback_url=fallback_url, note=note)
+    alias_tuple = tuple(a for a in (aliases or (name,)) if isinstance(a, str) and a.strip())
+    if name not in alias_tuple:
+        alias_tuple = (name, *alias_tuple)
+    fallback_tuple = tuple(
+        a for a in (fallback_aliases or ()) if isinstance(a, str) and a.strip() and a not in alias_tuple
+    )
+    return DshEndpoint(
+        name=name, models=models, fallback_url=fallback_url, note=note,
+        aliases=alias_tuple, fallback_aliases=fallback_tuple,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,26 +227,50 @@ def _find_blocks(doc: Any) -> List[Block]:
     return blocks
 
 
-def _endpoint_name_from_key(key: str, block: Dict[str, Any], origin: str) -> str:
-    """Display name for a provider block: displayName wins, else derived."""
+def _endpoint_name_from_key(
+    key: str, block: Dict[str, Any], origin: str
+) -> Tuple[str, List[str], List[str]]:
+    """Canonical + primary + fallback names for a provider block.
+
+    The canonical name keeps the old rule (``displayName`` wins, else
+    derived from the provider key).  Primary names are display-level —
+    the canonical name only.  Fallbacks are key-derived (raw key, key
+    with a leading ``llm-`` stripped, key-derived display name) and are
+    only consulted when no primary name matches.
+    """
+    raw_key = key.strip() if isinstance(key, str) else ""
+    unprefixed = raw_key[len("llm-"):] if raw_key.startswith("llm-") else raw_key
+    derived = base_display_name(unprefixed) if unprefixed else ""
     display = block.get("displayName")
-    if isinstance(display, str) and display.strip():
-        return display.strip()
-    provider_key = key.strip()
-    if provider_key.startswith("llm-"):
-        provider_key = provider_key[len("llm-"):]
-    if not provider_key:
+    display_name = display.strip() if isinstance(display, str) and display.strip() else ""
+    canonical = display_name or derived
+    if not canonical:
         raise ModelSyncError(f"{origin}: provider block without a usable name: {block!r}")
-    return base_display_name(provider_key)
+    primary: List[str] = [canonical]
+    fallbacks: List[str] = []
+    for candidate in (raw_key, unprefixed, derived):
+        if candidate and candidate not in primary and candidate not in fallbacks:
+            fallbacks.append(candidate)
+    return canonical, primary, fallbacks
 
 
-def _endpoint_name_from_object(doc: Dict[str, Any], origin: str) -> str:
+def _endpoint_name_from_object(doc: Dict[str, Any], origin: str) -> Tuple[str, List[str], List[str]]:
+    """Canonical + primary + fallback names for a bare endpoint object.
+
+    ``displayName`` wins as the canonical name; ``name`` stays a primary
+    alias.  Bare endpoint objects have no key-derived fallbacks.
+    """
+    display = doc.get("displayName")
+    display_name = display.strip() if isinstance(display, str) and display.strip() else ""
     raw = doc.get("name")
-    if not (isinstance(raw, str) and raw.strip()):
-        raw = doc.get("displayName")
-    if not isinstance(raw, str) or not raw.strip():
+    raw_name = raw.strip() if isinstance(raw, str) and raw.strip() else ""
+    canonical = display_name or raw_name
+    if not canonical:
         raise ModelSyncError(f"{origin}: endpoint object without a usable 'name' field")
-    return raw.strip()
+    primary = [canonical]
+    if raw_name and raw_name not in primary:
+        primary.append(raw_name)
+    return canonical, primary, []
 
 
 def extract_endpoints(data: Any, *, origin: str = "<source>") -> List[DshEndpoint]:
@@ -243,10 +287,10 @@ def extract_endpoints(data: Any, *, origin: str = "<source>") -> List[DshEndpoin
             continue
         for name_source, block, is_object in _find_blocks(doc):
             if is_object:
-                name = _endpoint_name_from_object(block, origin)
+                name, primary, fallbacks = _endpoint_name_from_object(block, origin)
             else:
-                name = _endpoint_name_from_key(str(name_source), block, origin)
-            endpoints.append(_build_endpoint(name, block))
+                name, primary, fallbacks = _endpoint_name_from_key(str(name_source), block, origin)
+            endpoints.append(_build_endpoint(name, block, aliases=primary, fallback_aliases=fallbacks))
     return endpoints
 
 
@@ -356,6 +400,7 @@ def load_dsh_source(
         files = _candidate_files(dsh_dir)
 
     index: Dict[str, DshEndpoint] = {}
+    folded: Dict[str, str] = {}
     warnings: List[str] = []
     for path in files:
         if not os.path.isfile(path):
@@ -365,12 +410,15 @@ def load_dsh_source(
         if not endpoints:
             warnings.append(f"no model lists found in {path}")
         for endpoint in endpoints:
-            if endpoint.name in index:
+            folded_name = fold_name(endpoint.name)
+            if folded_name in folded:
                 raise ModelSyncError(
                     f"duplicate source endpoint name {endpoint.name!r} "
-                    f"(in {path} and an earlier file) — one endpoint name may only "
+                    f"(in {path} and an earlier file; clashes with {folded[folded_name]!r}, "
+                    "names are matched case-insensitively) — one endpoint name may only "
                     "appear once across the loaded source files"
                 )
+            folded[folded_name] = endpoint.name
             index[endpoint.name] = endpoint
 
     if not index:

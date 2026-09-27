@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 CUSTOM_ENDPOINT_VENDOR = "customendpoint"
 
@@ -124,6 +124,15 @@ class DshEndpoint:
     ``fallback_url`` is the endpoint's normalised ``baseURL`` (when the
     source block provides one) and serves as the url fallback for models
     that carry no per-model url.
+    ``aliases`` holds the primary match names — the canonical ``name``
+    plus alternates at display level such as ``displayName``.
+    ``fallback_aliases`` holds key-derived alternates (raw provider key,
+    key with a leading ``llm-`` stripped, key-derived display name).
+    Matching against target endpoints is case-insensitive and two-level:
+    a target endpoint binds to the source endpoint whose *primary* names
+    match first (``displayName`` priority); key-derived fallbacks only
+    bind when no primary name matches (all comparisons after trimming
+    and Unicode case folding).
     """
 
     name: str
@@ -131,6 +140,29 @@ class DshEndpoint:
     fallback_url: Optional[str] = None
     #: Why the endpoint has no usable models (reported, not fatal).
     note: str = ""
+    #: Primary names this endpoint answers to (canonical ``name`` included).
+    aliases: Tuple[str, ...] = ()
+    #: Key-derived names, only used when no primary name matches.
+    fallback_aliases: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.aliases:
+            object.__setattr__(self, "aliases", (self.name,))
+
+    @property
+    def folded_aliases(self) -> Set[str]:
+        """Case-folded primary alias set used for binding (level 1)."""
+        return {fold_name(alias) for alias in self.aliases if isinstance(alias, str) and alias.strip()}
+
+    @property
+    def folded_fallback_aliases(self) -> Set[str]:
+        """Case-folded key-derived alias set, fallback level (level 2)."""
+        return {fold_name(alias) for alias in self.fallback_aliases if isinstance(alias, str) and alias.strip()}
+
+    @property
+    def folded_all_aliases(self) -> Set[str]:
+        """Union of primary and fallback folded aliases (scope checks)."""
+        return self.folded_aliases | self.folded_fallback_aliases
 
     @property
     def failed(self) -> bool:
@@ -194,6 +226,17 @@ def trimmed_name(provider: Any) -> Optional[str]:
     if isinstance(name, str) and name.strip():
         return name.strip()
     return None
+
+
+def fold_name(name: Any) -> str:
+    """Normalised endpoint-name key: trimmed + Unicode case-folded.
+
+    Matching is case-insensitive: ``"Iris"`` and ``"iris"`` fold to the
+    same key, while an empty/blank value folds to ``""`` (never matched).
+    """
+    if not isinstance(name, str):
+        return ""
+    return name.strip().casefold()
 
 
 @dataclass

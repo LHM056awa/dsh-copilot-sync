@@ -631,7 +631,17 @@ def test_missing_target_endpoint_name_is_error():
     source = _make_source("EndpointA", [{"id": "new-model"}])
     target = [_custom_endpoint("EndpointA", models=[])]
     with pytest.raises(ModelSyncError, match="unknown target endpoint"):
-        sync_config(target, source, allow_delete=True, provider_names=["endpointa"])
+        sync_config(target, source, allow_delete=True, provider_names=["NoSuchEndpoint"])
+
+
+def test_provider_flag_matches_case_insensitively():
+    # "--provider endpointa" must bind the target "EndpointA" (and its
+    # same-folded source endpoint) instead of raising.
+    source = _make_source("EndpointA", [{"id": "new-model", "url": "https://x.example.com"}])
+    target = [_custom_endpoint("EndpointA", models=[])]
+    outcome = sync_config(target, source, allow_delete=True, provider_names=["endpointa"])
+    assert [m["id"] for m in outcome.config[0]["models"]] == ["new-model"]
+    assert outcome.providers[0].status == "synced"
 
 
 def test_blank_only_provider_name_raises():
@@ -748,3 +758,184 @@ def test_cli_partial_failure_exit_code(tmp_path, capsys):
 
     code = run(["--dsh-dir", str(source_dir), "--config", str(target), "--all"])
     assert code == 2, f"expected partial-failure exit code, got {code}"
+
+
+# ---------------------------------------------------------------------------
+# extra: case-insensitive binding via any alias name
+# ---------------------------------------------------------------------------
+
+
+def test_case_insensitive_binding_syncs():
+    # Source "EndpointA" binds target "endpointa" (and vice versa).
+    source = _make_source("EndpointA", [{"id": "new-model", "url": "https://x.example.com"}])
+    target = [_custom_endpoint("  endpointa  ", models=[])]
+    outcome = sync_config(target, source, allow_delete=True)
+    assert [m["id"] for m in outcome.config[0]["models"]] == ["new-model"]
+    assert outcome.providers[0].status == "synced"
+    assert outcome.unmatched_source == []
+
+
+def test_alias_binding_via_provider_key(tmp_path):
+    # providers: iris: + displayName: Iris ; target named "iris" binds.
+    source_dir = tmp_path / "dsh"
+    source_dir.mkdir()
+    (source_dir / "settings.yaml.imported").write_text(
+        "llm-gateway:\n"
+        "  providers:\n"
+        "    iris:\n"
+        "      displayName: Iris\n"
+        "      baseURL: https://api.example.com/v1\n"
+        "      models:\n"
+        "        - id: model-a\n",
+        encoding="utf-8",
+    )
+    index = load_dsh_source(str(source_dir))
+    endpoint = index.endpoints["Iris"]
+    assert set(endpoint.aliases) == {"Iris"}
+    assert set(endpoint.fallback_aliases) == {"iris"}
+
+    target = [_custom_endpoint("iris", models=[])]
+    outcome = sync_config(target, index, allow_delete=True)
+    assert [m["id"] for m in outcome.config[0]["models"]] == ["model-a"]
+    assert outcome.providers[0].status == "synced"
+    assert outcome.unmatched_source == []
+
+    # The canonical upper-case target name binds too.
+    outcome2 = sync_config([_custom_endpoint("IRIS", models=[])], index, allow_delete=True)
+    assert [m["id"] for m in outcome2.config[0]["models"]] == ["model-a"]
+
+
+def test_case_insensitive_target_duplicates_are_ambiguous():
+    # "EndpointA" + "endpointa" in the target fold to one name -> error, untouched.
+    source = _make_source("EndpointA", [{"id": "new-model", "url": "https://x.example.com"}])
+    target = [
+        _custom_endpoint("EndpointA", models=[]),
+        _custom_endpoint("endpointa", models=[]),
+    ]
+    outcome = sync_config(target, source, allow_delete=True)
+    assert len(outcome.providers) == 1
+    assert outcome.providers[0].status == "skipped"
+    assert any("appears 2 times" in e for e in outcome.providers[0].errors)
+    assert outcome.config[0]["models"] == [] and outcome.config[1]["models"] == []
+    assert outcome.changed is False
+
+
+def test_target_matching_multiple_source_endpoints_is_ambiguous():
+    # Two distinct source endpoints both claim the alias "shared".
+    first = DshEndpoint(name="Alpha", models=[DshModel.from_raw({"id": "m"})], aliases=("Alpha", "shared"))
+    second = DshEndpoint(name="Beta", models=[DshModel.from_raw({"id": "m"})], aliases=("Beta", "shared"))
+    source = DshSourceIndex(endpoints={"Alpha": first, "Beta": second})
+    target = [_custom_endpoint("Shared", models=[_model_obj("local")])]
+    outcome = sync_config(target, source, allow_delete=True)
+    assert outcome.providers[0].status == "skipped"
+    assert any("2 source endpoints" in e for e in outcome.providers[0].errors)
+    assert [m["id"] for m in outcome.config[0]["models"]] == ["local"]
+    assert outcome.changed is False
+
+
+def test_duplicate_source_endpoint_names_case_insensitive_raise(tmp_path):
+    source_dir = tmp_path / "dsh"
+    source_dir.mkdir()
+    (source_dir / "a.json").write_text(
+        json.dumps([{"name": "EndpointA", "models": [{"id": "m1"}]}]), encoding="utf-8"
+    )
+    (source_dir / "b.json").write_text(
+        json.dumps([{"name": "endpointa", "models": [{"id": "m2"}]}]), encoding="utf-8"
+    )
+    with pytest.raises(ModelSyncError, match="duplicate source endpoint name"):
+        load_dsh_source(str(source_dir))
+
+
+def test_unmatched_source_only_lists_truly_unbound(tmp_path):
+    # With case-insensitive binding, "Iris" (alias "iris") bound to target
+    # "IRIS" must not show up as unmatched; only "Zedco" does.
+    # (Two plain .json files: no preferred settings file, so both load.)
+    source_dir = tmp_path / "dsh"
+    source_dir.mkdir()
+    (source_dir / "a.json").write_text(
+        json.dumps({"llm-gateway": {"providers": {"iris": {
+            "displayName": "Iris",
+            "models": [{"id": "model-a", "url": "https://api.example.com"}],
+        }}}}),
+        encoding="utf-8",
+    )
+    (source_dir / "b.json").write_text(
+        json.dumps([{"name": "Zedco", "models": [{"id": "z", "url": "https://z.example.com"}]}]),
+        encoding="utf-8",
+    )
+    index = load_dsh_source(str(source_dir))
+    target = [_custom_endpoint("IRIS", models=[])]
+    outcome = sync_config(target, index, allow_delete=True)
+    assert outcome.unmatched_source == ["Zedco"]
+
+
+# ---------------------------------------------------------------------------
+# extra: displayName priority over provider-key fallbacks (two-level binding)
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_binding_via_provider_key_only():
+    # No displayName anywhere: the key-derived fallback still binds.
+    first = DshEndpoint(name="Iris", models=[DshModel.from_raw({"id": "m"})],
+                        fallback_aliases=("iris",))
+    source = DshSourceIndex(endpoints={"Iris": first})
+    target = [_custom_endpoint("IRIS", models=[_model_obj("local")])]
+    outcome = sync_config(target, source, allow_delete=True)
+    # "local" is target-only -> deleted; "m" has no url anywhere -> skipped
+    # with an error. The point: the endpoint bound (not "no-source").
+    assert outcome.providers[0].status != "no-source"
+    assert outcome.unmatched_source == []
+
+
+def test_display_name_beats_provider_key_of_another_endpoint():
+    # A.displayName "Iris" (level 1) wins over B's key "iris" (level 2):
+    # target "iris" binds A, no ambiguity.
+    a_models = [DshModel.from_raw({"id": "a", "url": "https://a.example.com"})]
+    b_models = [DshModel.from_raw({"id": "b", "url": "https://b.example.com"})]
+    a = DshEndpoint(name="Iris", models=a_models, fallback_aliases=("something-else",))
+    b = DshEndpoint(name="Other", models=b_models, fallback_aliases=("iris",))
+    source = DshSourceIndex(endpoints={"Iris": a, "Other": b})
+    target = [_custom_endpoint("iris", models=[])]
+    outcome = sync_config(target, source, allow_delete=True)
+    assert outcome.providers[0].status == "synced"
+    assert outcome.providers[0].errors == []
+    assert [m["id"] for m in outcome.config[0]["models"]] == ["a"]
+    # B was never bound -> reported as unmatched.
+    assert outcome.unmatched_source == ["Other"]
+
+
+def test_same_level_multi_source_still_ambiguous():
+    # Two source endpoints sharing one level-1 name stay ambiguous.
+    first = DshEndpoint(name="Alpha", models=[DshModel.from_raw({"id": "m", "url": "https://x.example.com"})],
+                        aliases=("Alpha", "Shared"))
+    second = DshEndpoint(name="Beta", models=[DshModel.from_raw({"id": "m", "url": "https://x.example.com"})],
+                         aliases=("Beta", "Shared"))
+    source = DshSourceIndex(endpoints={"Alpha": first, "Beta": second})
+    target = [_custom_endpoint("shared", models=[])]
+    outcome = sync_config(target, source, allow_delete=True)
+    assert outcome.providers[0].status == "skipped"
+    assert any("2 source endpoints" in e and "display names" in e for e in outcome.providers[0].errors)
+    assert outcome.changed is False
+
+
+def test_endpoint_object_display_name_wins_canonical(tmp_path):
+    # Bare endpoint objects: displayName becomes the canonical name,
+    # `name` stays a primary alias.
+    source_dir = tmp_path / "dsh"
+    source_dir.mkdir()
+    (source_dir / "a.json").write_text(
+        json.dumps([{"name": "legacy-key", "displayName": "Pretty",
+                     "models": [{"id": "m1", "url": "https://x.example.com"}]}]),
+        encoding="utf-8",
+    )
+    index = load_dsh_source(str(source_dir))
+    assert set(index.endpoints) == {"Pretty"}
+    endpoint = index.endpoints["Pretty"]
+    assert set(endpoint.aliases) == {"Pretty", "legacy-key"}
+    assert endpoint.fallback_aliases == ()
+
+    # Binds via either primary name (case-insensitively).
+    for target_name in ("pretty", "LEGACY-KEY"):
+        outcome = sync_config([_custom_endpoint(target_name, models=[])], index, allow_delete=True)
+        assert [m["id"] for m in outcome.config[0]["models"]] == ["m1"]
+        assert outcome.unmatched_source == []
